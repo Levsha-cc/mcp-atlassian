@@ -1,5 +1,6 @@
 """Attachment operations for Jira API."""
 
+import base64
 import logging
 import os
 from pathlib import Path
@@ -278,5 +279,163 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             "issue_key": issue_key,
             "total": len(file_paths),
             "uploaded": uploaded,
+            "failed": failed,
+        }
+
+    def get_issue_attachments_content(
+        self,
+        issue_key: str,
+        only_images: bool = True,
+        max_attachments: int = 5,
+        max_bytes_per_attachment: int = 1_000_000,
+    ) -> dict[str, Any]:
+        """Return attachment contents for a Jira issue encoded as base64.
+
+        This method fetches attachments for the given issue and returns their
+        metadata together with an optional base64-encoded representation of the
+        file content. It is primarily intended for small binary assets such as
+        screenshots or other images that should be directly inspected by an
+        AI agent.
+
+        The method applies several safety limits to avoid excessive payload
+        sizes:
+        - ``max_attachments`` limits the number of attachments included.
+        - ``max_bytes_per_attachment`` limits how many bytes are read from
+          each attachment. If the file is larger, it is truncated and
+          reported as such.
+
+        Args:
+            issue_key: Jira issue key (e.g., "PROJ-123").
+            only_images: If True, only image attachments ("image/*") are
+                returned.
+            max_attachments: Maximum number of attachments to include.
+            max_bytes_per_attachment: Maximum number of bytes to read per
+                attachment before truncating.
+
+        Returns:
+            Dictionary describing returned attachments and any failures.
+        """
+
+        if max_attachments <= 0 or max_bytes_per_attachment <= 0:
+            return {
+                "success": False,
+                "issue_key": issue_key,
+                "error": "max_attachments and max_bytes_per_attachment must be positive",
+            }
+
+        logger.info(
+            "Fetching attachments content for %s (only_images=%s, max_attachments=%s, max_bytes_per_attachment=%s)",
+            issue_key,
+            only_images,
+            max_attachments,
+            max_bytes_per_attachment,
+        )
+
+        # Reuse the existing Jira client to fetch the issue with attachment
+        # metadata only. This avoids downloading heavy data until we explicitly
+        # request the file content below.
+        issue_data = self.jira.issue(issue_key, fields="attachment")
+
+        if not isinstance(issue_data, dict):
+            msg = f"Unexpected return value type from `jira.issue`: {type(issue_data)}"
+            logger.error(msg)
+            raise TypeError(msg)
+
+        attachment_field = issue_data.get("fields", {}).get("attachment", [])
+        if not attachment_field:
+            return {
+                "success": True,
+                "issue_key": issue_key,
+                "total": 0,
+                "returned": 0,
+                "attachments": [],
+                "failed": [],
+            }
+
+        attachments: list[JiraAttachment] = []
+        for raw_attachment in attachment_field:
+            if isinstance(raw_attachment, dict):
+                attachments.append(JiraAttachment.from_api_response(raw_attachment))
+
+        # Optionally filter to image/* attachments only.
+        def _is_image(attachment: JiraAttachment) -> bool:
+            if not attachment.content_type:
+                return False
+            return attachment.content_type.lower().startswith("image/")
+
+        if only_images:
+            attachments = [a for a in attachments if _is_image(a)]
+
+        total_available = len(attachments)
+        attachments = attachments[:max_attachments]
+
+        results: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+
+        for attachment in attachments:
+            if not attachment.url:
+                logger.warning("No URL for attachment %s", attachment.filename)
+                failed.append(
+                    {
+                        "filename": attachment.filename,
+                        "id": attachment.id,
+                        "error": "No URL available for attachment",
+                    }
+                )
+                continue
+
+            try:
+                logger.info("Downloading attachment content from %s", attachment.url)
+                response = self.jira._session.get(attachment.url, stream=True)
+                response.raise_for_status()
+
+                # Read up to max_bytes_per_attachment bytes.
+                remaining = max_bytes_per_attachment
+                chunks: list[bytes] = []
+                truncated = False
+
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        truncated = True
+                        remaining = 0
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+
+                content_bytes = b"".join(chunks)
+                content_b64 = base64.b64encode(content_bytes).decode("ascii")
+
+                attachment_info = attachment.to_simplified_dict()
+                attachment_info["content_base64"] = content_b64
+                attachment_info["truncated"] = truncated
+
+                results.append(attachment_info)
+
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Error fetching attachment content for %s: %s",
+                    attachment.filename,
+                    exc,
+                )
+                failed.append(
+                    {
+                        "filename": attachment.filename,
+                        "id": attachment.id,
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "total": total_available,
+            "returned": len(results),
+            "attachments": results,
             "failed": failed,
         }

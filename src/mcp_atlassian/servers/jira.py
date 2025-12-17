@@ -380,6 +380,77 @@ async def download_attachments(
 
 
 @jira_mcp.tool(tags={"jira", "read"})
+async def get_issue_attachments(
+    ctx: Context,
+    issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
+    only_images: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true, only image attachments (content_type starting with 'image/') "
+                "are returned."
+            ),
+            default=True,
+        ),
+    ] = True,
+    max_attachments: Annotated[
+        int,
+        Field(
+            description="Maximum number of attachments to include in the response.",
+            default=5,
+            ge=1,
+        ),
+    ] = 5,
+    max_bytes_per_attachment: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum number of bytes to read from each attachment before "
+                "truncating the content. This protects against very large files."
+            ),
+            default=1_000_000,
+            ge=1,
+        ),
+    ] = 1_000_000,
+) -> str:
+    """Get attachments for a Jira issue with optional base64-encoded content.
+
+    This tool is intended for cases where an AI agent needs to inspect the actual
+    binary content of small attachments (most commonly screenshots) rather than
+    just their filenames. It returns attachment metadata along with a
+    ``content_base64`` field for each successfully fetched file.
+
+    To avoid excessively large responses, you can:
+    - Restrict the number of attachments via ``max_attachments``.
+    - Limit the bytes read per attachment via ``max_bytes_per_attachment``;
+      if a file exceeds this limit, its content is truncated and the
+      ``truncated`` flag is set to true in the result.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key (e.g., ``"PROJ-123"``).
+        only_images: If true, only attachments with ``content_type`` starting
+            with ``"image/"`` are returned.
+        max_attachments: Maximum number of attachments to include.
+        max_bytes_per_attachment: Maximum number of bytes to read per
+            attachment before truncating.
+
+    Returns:
+        JSON string describing returned attachments with base64 content and
+        any failures.
+    """
+
+    jira = await get_jira_fetcher(ctx)
+    result = jira.get_issue_attachments_content(
+        issue_key=issue_key,
+        only_images=only_images,
+        max_attachments=max_attachments,
+        max_bytes_per_attachment=max_bytes_per_attachment,
+    )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "read"})
 async def get_agile_boards(
     ctx: Context,
     board_name: Annotated[
